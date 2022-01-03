@@ -1,148 +1,159 @@
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-import torch.optim as optim
-import torch
-import numpy as np
-import time
+from __future__ import print_function
+import argparse
 import os
-import datetime
+import random
+import torch
+import torch.nn.parallel
+import torch.optim as optim
+import torch.utils.data
+from dataset import ShapeNetDataset, ModelNetDataset
+from model import PointNetCls, feature_transform_regularizer
+import torch.nn.functional as F
+from tqdm import tqdm
+import visdom
 
-from dataset import PointNetDataset
-from model import PointNet
 
-SEED = 13
-batch_size = 32
-epochs = 100
-decay_lr_factor = 0.95
-decay_lr_every = 2
-lr = 0.01
-gpus = [0]
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    '--batchSize', type=int, default=32, help='input batch size')
+parser.add_argument(
+    '--num_points', type=int, default=2500, help='input batch size')
+parser.add_argument(
+    '--workers', type=int, help='number of data loading workers', default=4)
+parser.add_argument(
+    '--nepoch', type=int, default=250, help='number of epochs to train for')
+parser.add_argument('--outf', type=str, default='cls', help='output folder')
+parser.add_argument('--model', type=str, default='', help='model path')
+parser.add_argument('--dataset', type=str, required=True, help="dataset path")
+parser.add_argument('--dataset_type', type=str, default='shapenet', help="dataset type shapenet|modelnet40")
+parser.add_argument('--feature_transform', action='store_true', help="use feature transform")
+
+opt = parser.parse_args()
+print(opt)
+
+blue = lambda x: '\033[94m' + x + '\033[0m'
+
+opt.manualSeed = random.randint(1, 10000)  # fix seed
+print("Random Seed: ", opt.manualSeed)
+random.seed(opt.manualSeed)
+torch.manual_seed(opt.manualSeed)
+
+if opt.dataset_type == 'shapenet':
+    dataset = ShapeNetDataset(
+        root=opt.dataset,
+        classification=True,
+        npoints=opt.num_points)
+
+    test_dataset = ShapeNetDataset(
+        root=opt.dataset,
+        classification=True,
+        split='test',
+        npoints=opt.num_points,
+        data_augmentation=False)
+elif opt.dataset_type == 'modelnet40':
+    dataset = ModelNetDataset(
+        root=opt.dataset,
+        npoints=opt.num_points,
+        split='trainval')
+
+    test_dataset = ModelNetDataset(
+        root=opt.dataset,
+        split='test',
+        npoints=opt.num_points,
+        data_augmentation=False)
+else:
+    exit('wrong dataset type')
+
+
+dataloader = torch.utils.data.DataLoader(
+    dataset,
+    batch_size=opt.batchSize,
+    shuffle=True,
+    num_workers=int(opt.workers))
+
+testdataloader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=opt.batchSize,
+        shuffle=True,
+        num_workers=int(opt.workers))
+
+print(len(dataset), len(test_dataset))
+num_classes = len(dataset.classes)
+print('classes', num_classes)
+
+try:
+    os.makedirs(opt.outf)
+except OSError:
+    pass
+
+classifier = PointNetCls(k=num_classes, feature_transform=opt.feature_transform)
+
+if opt.model != '':
+    classifier.load_state_dict(torch.load(opt.model))
+
+
+optimizer = optim.Adam(classifier.parameters(), lr=0.001, betas=(0.9, 0.999))
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+classifier.cuda()
+
+# visualization
+viz = visdom.Visdom()
+viz.line([0], [-1], win='loss', opts=dict(title='loss'))
+viz.line([0], [-1], win='val_acc', opts=dict(title='val_acc'))
 global_step = 0
-show_every = 1
-val_every = 3
-date = datetime.date.today()
-save_dir = "../output"
 
+num_batch = len(dataset) / opt.batchSize
 
-def save_ckp(ckp_dir, model, optimizer, epoch, best_acc, date):
-  os.makedirs(ckp_dir, exist_ok=True)
-  state = {
-    'state_dict': model.state_dict(),
-    'optimizer': optimizer.state_dict()
-    }
-  ckp_path = os.path.join(ckp_dir, f'date_{date}-epoch_{epoch}-maxacc_{best_acc:.3f}.pth')
-  torch.save(state, ckp_path)
-  torch.save(state, os.path.join(ckp_dir,f'latest.pth'))
-  print('model saved to %s' % ckp_path)
+for epoch in range(opt.nepoch):
+    scheduler.step()
+    for i, data in enumerate(dataloader, 0):
+        points, target = data
+        target = target[:, 0]
+        points = points.transpose(2, 1)
+        points, target = points.cuda(), target.cuda()
+        optimizer.zero_grad()
+        classifier = classifier.train()
+        pred, trans, trans_feat = classifier(points)
+        loss = F.nll_loss(pred, target)
+        if opt.feature_transform:
+            loss += feature_transform_regularizer(trans_feat) * 0.001
+        loss.backward()
+        optimizer.step()
+        pred_choice = pred.data.max(1)[1]
+        correct = pred_choice.eq(target.data).cpu().sum()
+        print('[%d: %d/%d] train loss: %f accuracy: %f' % (epoch, i, num_batch, loss.item(), correct.item() / float(opt.batchSize)))
+        viz.line([loss.item()], [global_step], win='loss', update='append')
+        global_step +=1
 
+        if i % 10 == 0:
+            j, data = next(enumerate(testdataloader, 0))
+            points, target = data
+            target = target[:, 0]
+            points = points.transpose(2, 1)
+            points, target = points.cuda(), target.cuda()
+            classifier = classifier.eval()
+            pred, _, _ = classifier(points)
+            loss = F.nll_loss(pred, target)
+            pred_choice = pred.data.max(1)[1]
+            correct = pred_choice.eq(target.data).cpu().sum()
+            val_acc = correct.item()/float(opt.batchSize)
+            print('[%d: %d/%d] %s loss: %f accuracy: %f' % (epoch, i, num_batch, blue('test'), loss.item(), val_acc))
+            viz.line([val_acc], [global_step], win='val_acc', update='append')
 
-def load_ckp(ckp_path, model, optimizer):
-  state = torch.load(ckp_path)
-  model.load_state_dict(state['state_dict'])
-  optimizer.load_state_dict(state['optimizer'])
-  print("model load from %s" % ckp_path)
+    torch.save(classifier.state_dict(), '%s/cls_model_%d.pth' % (opt.outf, epoch))
 
+total_correct = 0
+total_testset = 0
+for i,data in tqdm(enumerate(testdataloader, 0)):
+    points, target = data
+    target = target[:, 0]
+    points = points.transpose(2, 1)
+    points, target = points.cuda(), target.cuda()
+    classifier = classifier.eval()
+    pred, _, _ = classifier(points)
+    pred_choice = pred.data.max(1)[1]
+    correct = pred_choice.eq(target.data).cpu().sum()
+    total_correct += correct.item()
+    total_testset += points.size()[0]
 
-def softXEnt(prediction, real_class):
-    # TODO: return loss here
-
-
-def get_eval_acc_results(model, data_loader, device):
-    """
-    ACC
-    """
-    seq_id = 0
-    model.eval()
-
-    distribution = np.zeros([5])
-    confusion_matrix = np.zeros([5, 5])
-    pred_ys = []
-    gt_ys = []
-    with torch.no_grad():
-        accs = []
-        for x, y in data_loader:
-            x = x.to(device)
-            y = y.to(device)
-
-            # TODO: put x into network and get out
-            out = 
-
-            # TODO: get pred_y from out
-            pred_y =
-            gt = np.argmax(y.cpu().numpy(), axis=1)
-
-            # TODO: calculate acc from pred_y and gt
-            acc = 
-            gt_ys = np.append(gt_ys, gt)
-            pred_ys = np.append(pred_ys, pred_y)
-            idx = gt
-
-            accs.append(acc)
-
-        return np.mean(accs)
-
-
-if __name__ == "__main__":
-    writer = SummaryWriter('./output/runs/tersorboard')
-    torch.manual_seed(SEED)
-    device = torch.device(f'cuda:{gpus[0]}' if torch.cuda.is_available() else 'cpu')
-    print("Loading train dataset...")
-    train_data = PointNetDataset("../../../dataset/modelnet40_normal_resampled", train=0)
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-    print("Loading valid dataset...")
-    val_data = PointNetDataset("../../../dataset/modelnet40_normal_resampled/", train=1)
-    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=True)
-    print("Set model and optimizer...")
-    model = PointNet().to(device=device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.StepLR(
-          optimizer, step_size=decay_lr_every, gamma=decay_lr_factor)
-
-    best_acc = 0.0
-    model.train()
-    print("Start trainning...")
-    for epoch in range(epochs):
-      acc_loss = 0.0
-      num_samples = 0
-      start_tic = time.time()
-      for x, y in train_loader:
-        x = x.to(device)
-        y = y.to(device)
-
-        # TODO: set grad to zero
-
-        # TODO: put x into network and get out
-        out = 
-
-        loss = softXEnt(out, y)
-        
-        # TODO: loss backward
-
-        # TODO: update network's param
-        
-        acc_loss += batch_size * loss.item()
-        num_samples += y.shape[0]
-        global_step += 1
-        acc = np.sum(np.argmax(out.cpu().detach().numpy(), axis=1) == np.argmax(y.cpu().detach().numpy(), axis=1)) / len(y)
-        # print('acc: ', acc)
-        if (global_step + 1) % show_every == 0:
-          # ...log the running loss
-          writer.add_scalar('training loss', acc_loss / num_samples, global_step)
-          writer.add_scalar('training acc', acc, global_step)
-          # print( f"loss at epoch {epoch} step {global_step}:{loss.item():3f}, lr:{optimizer.state_dict()['param_groups'][0]['lr']: .6f}, time:{time.time() - start_tic: 4f}sec")
-      scheduler.step()
-      print(f"loss at epoch {epoch}:{acc_loss / num_samples:.3f}, lr:{optimizer.state_dict()['param_groups'][0]['lr']: .6f}, time:{time.time() - start_tic: 4f}sec")
-      
-      if (epoch + 1) % val_every == 0:
-        
-        acc = get_eval_acc_results(model, val_loader, device)
-        print("eval at epoch[" + str(epoch) + f"] acc[{acc:3f}]")
-        writer.add_scalar('validing acc', acc, global_step)
-
-        if acc > best_acc:
-          best_acc = acc
-          save_ckp(save_dir, model, optimizer, epoch, best_acc, date)
-
-          example = torch.randn(1, 3, 10000).to(device)
-          traced_script_module = torch.jit.trace(model, example)
-          traced_script_module.save("../output/traced_model.pt")
+print("final accuracy {}".format(total_correct / float(total_testset)))
